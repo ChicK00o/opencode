@@ -26,7 +26,6 @@ import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { Tooltip, TooltipKeybind } from "@opencode-ai/ui/tooltip"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Select } from "@opencode-ai/ui/select"
-import { RadioGroup } from "@opencode-ai/ui/radio-group"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { ModelSelectorPopover } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaid } from "@/components/dialog-select-model-unpaid"
@@ -39,7 +38,8 @@ import { usePlatform } from "@/context/platform"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { createTextFragment, getCursorPosition, setCursorPosition, setRangeEdge } from "./prompt-input/editor-dom"
-import { createPromptAttachments, ACCEPTED_FILE_TYPES } from "./prompt-input/attachments"
+import { createPromptAttachments } from "./prompt-input/attachments"
+import { ACCEPTED_FILE_TYPES } from "./prompt-input/files"
 import {
   canNavigateHistoryAtCursor,
   navigatePromptHistory,
@@ -49,7 +49,7 @@ import {
   type PromptHistoryStoredEntry,
   promptLength,
 } from "./prompt-input/history"
-import { createPromptSubmit } from "./prompt-input/submit"
+import { createPromptSubmit, type FollowupDraft } from "./prompt-input/submit"
 import { PromptPopover, type AtOption, type SlashCommand } from "./prompt-input/slash-popover"
 import { PromptContextItems } from "./prompt-input/context-items"
 import { PromptImageAttachments } from "./prompt-input/image-attachments"
@@ -62,6 +62,11 @@ interface PromptInputProps {
   ref?: (el: HTMLDivElement) => void
   newSessionWorktree?: string
   onNewSessionWorktreeReset?: () => void
+  edit?: { id: string; prompt: Prompt; context: FollowupDraft["context"] }
+  onEditLoaded?: () => void
+  shouldQueue?: () => boolean
+  onQueue?: (draft: FollowupDraft) => void
+  onAbort?: () => void
   onSubmit?: () => void
 }
 
@@ -116,7 +121,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   let slashPopoverRef!: HTMLDivElement
 
   const mirror = { input: false }
-  const inset = 44
+  const inset = 52
+  const space = `${inset}px`
 
   const scrollCursorIntoView = () => {
     const container = scrollRef
@@ -151,8 +157,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     }
   }
 
-  const queueScroll = () => {
-    requestAnimationFrame(scrollCursorIntoView)
+  const queueScroll = (count = 2) => {
+    requestAnimationFrame(() => {
+      scrollCursorIntoView()
+      if (count > 1) queueScroll(count - 1)
+    })
   }
 
   const activeFileTab = createSessionTabs({
@@ -948,6 +957,45 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     setCurrentHistory("entries", next)
   }
 
+  createEffect(
+    on(
+      () => props.edit?.id,
+      (id) => {
+        const edit = props.edit
+        if (!id || !edit) return
+
+        for (const item of prompt.context.items()) {
+          prompt.context.remove(item.key)
+        }
+
+        for (const item of edit.context) {
+          prompt.context.add({
+            type: item.type,
+            path: item.path,
+            selection: item.selection,
+            comment: item.comment,
+            commentID: item.commentID,
+            commentOrigin: item.commentOrigin,
+            preview: item.preview,
+          })
+        }
+
+        setStore("mode", "normal")
+        setStore("popover", null)
+        setStore("historyIndex", -1)
+        setStore("savedPrompt", null)
+        prompt.set(edit.prompt, promptLength(edit.prompt))
+        requestAnimationFrame(() => {
+          editorRef.focus()
+          setCursorPosition(editorRef, promptLength(edit.prompt))
+          queueScroll()
+        })
+        props.onEditLoaded?.()
+      },
+      { defer: true },
+    ),
+  )
+
   const navigateHistory = (direction: "up" | "down") => {
     const result = navigatePromptHistory({
       direction,
@@ -964,7 +1012,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     return true
   }
 
-  const { addImageAttachment, removeImageAttachment, handlePaste } = createPromptAttachments({
+  const { addAttachment, removeAttachment, handlePaste } = createPromptAttachments({
     editor: () => editorRef,
     isFocused,
     isDialogActive: () => !!dialog.active,
@@ -1002,6 +1050,9 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     setPopover: (popover) => setStore("popover", popover),
     newSessionWorktree: () => props.newSessionWorktree,
     onNewSessionWorktreeReset: props.onNewSessionWorktreeReset,
+    shouldQueue: props.shouldQueue,
+    onQueue: props.onQueue,
+    onAbort: props.onAbort,
     onSubmit: props.onSubmit,
   })
 
@@ -1201,7 +1252,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
           onOpen={(attachment) =>
             dialog.show(() => <ImagePreview src={attachment.dataUrl} alt={attachment.filename} />)
           }
-          onRemove={removeImageAttachment}
+          onRemove={removeAttachment}
           removeLabel={language.t("prompt.attachment.remove")}
         />
         <div
@@ -1219,7 +1270,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
             editorRef?.focus()
           }}
         >
-          <div class="relative max-h-[240px] overflow-y-auto no-scrollbar" ref={(el) => (scrollRef = el)}>
+          <div
+            class="relative max-h-[240px] overflow-y-auto no-scrollbar"
+            ref={(el) => (scrollRef = el)}
+            style={{ "scroll-padding-bottom": space }}
+          >
             <div
               data-component="prompt-input"
               ref={(el) => {
@@ -1241,21 +1296,33 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
               onKeyDown={handleKeyDown}
               classList={{
                 "select-text": true,
-                "w-full pl-3 pr-2 pt-2 pb-11 text-14-regular text-text-strong focus:outline-none whitespace-pre-wrap": true,
+                "w-full pl-3 pr-2 pt-2 text-14-regular text-text-strong focus:outline-none whitespace-pre-wrap": true,
                 "[&_[data-type=file]]:text-syntax-property": true,
                 "[&_[data-type=agent]]:text-syntax-type": true,
                 "font-mono!": store.mode === "shell",
               }}
+              style={{ "padding-bottom": space }}
             />
             <Show when={!prompt.dirty()}>
               <div
-                class="absolute top-0 inset-x-0 pl-3 pr-2 pt-2 pb-11 text-14-regular text-text-weak pointer-events-none whitespace-nowrap truncate"
+                class="absolute top-0 inset-x-0 pl-3 pr-2 pt-2 text-14-regular text-text-weak pointer-events-none whitespace-nowrap truncate"
                 classList={{ "font-mono!": store.mode === "shell" }}
+                style={{ "padding-bottom": space }}
               >
                 {placeholder()}
               </div>
             </Show>
           </div>
+
+          <div
+            aria-hidden="true"
+            class="pointer-events-none absolute inset-x-0 bottom-0"
+            style={{
+              height: space,
+              background:
+                "linear-gradient(to top, var(--surface-raised-stronger-non-alpha) calc(100% - 20px), transparent)",
+            }}
+          />
 
           <div class="pointer-events-none absolute bottom-2 right-2 flex items-center gap-2">
             <input
@@ -1265,7 +1332,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
               class="hidden"
               onChange={(e) => {
                 const file = e.currentTarget.files?.[0]
-                if (file) addImageAttachment(file)
+                if (file) void addAttachment(file)
                 e.currentTarget.value = ""
               }}
             />
@@ -1487,36 +1554,6 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                   />
                 </TooltipKeybind>
               </div>
-            </div>
-            <div class="shrink-0">
-              <RadioGroup
-                options={["shell", "normal"] as const}
-                current={store.mode}
-                value={(mode) => mode}
-                label={(mode) => (
-                  <TooltipKeybind
-                    placement="top"
-                    gutter={4}
-                    openDelay={2000}
-                    title={language.t(mode === "shell" ? "prompt.mode.shell" : "prompt.mode.normal")}
-                    keybind={command.keybind(mode === "shell" ? "prompt.mode.shell" : "prompt.mode.normal")}
-                    class="size-full flex items-center justify-center"
-                  >
-                    <Icon
-                      name={mode === "shell" ? "console" : "prompt"}
-                      class="size-[18px]"
-                      classList={{
-                        "text-icon-strong-base": store.mode === mode,
-                        "text-icon-weak": store.mode !== mode,
-                      }}
-                    />
-                  </TooltipKeybind>
-                )}
-                onSelect={(mode) => mode && setMode(mode)}
-                fill
-                pad="none"
-                class="w-[68px]"
-              />
             </div>
           </div>
         </DockTray>
